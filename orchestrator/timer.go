@@ -126,7 +126,7 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 		promptBuilder.WriteString(fmt.Sprintf("%s: %s\n", m.Role, m.Message))
 	}
 
-	promptBuilder.WriteString("\nEvaluate the user's progress. If they are off track, immediately remind them of their goals. If they are on track, encourage them. Set the next check-in timer appropriately (e.g. 5-10 mins if struggling, 25 mins if focusing well). If the user explicitly asks to test a feature (like scheduling a call), you must comply and reschedule or execute the test immediately, even if it interrupts their schedule. If the user asks to see their active tasks, scheduled calls, or system status, you MUST provide this information in your message to them while maintaining your strict persona. Return the structured JSON response.")
+	promptBuilder.WriteString("\nEvaluate the user's progress based on your system instructions. Set the next check-in timer appropriately (e.g. 5-10 mins if struggling, 25 mins if focusing well). If the user explicitly asks to test a feature (like scheduling a call), you must comply and reschedule or execute the test immediately. If the user asks to see their active tasks, scheduled calls, or system status, you MUST provide this information in your message to them. Return the structured JSON response.")
 
 	response, err := o.llm.Evaluate(promptBuilder.String())
 	if err != nil {
