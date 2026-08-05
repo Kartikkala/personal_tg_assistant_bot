@@ -1,0 +1,229 @@
+package db
+
+import (
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "github.com/lib/pq"
+	"ai_enforcer/models"
+)
+
+type PostgresDB struct {
+	conn *sql.DB
+}
+
+func NewPostgresDB(connStr string) (*PostgresDB, error) {
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	p := &PostgresDB{conn: db}
+	if err := p.initTables(); err != nil {
+		return nil, err
+	}
+
+	return p, nil
+}
+
+func (p *PostgresDB) initTables() error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id SERIAL PRIMARY KEY,
+			description TEXT NOT NULL,
+			status VARCHAR(50) DEFAULT 'pending',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS chat_logs (
+			id SERIAL PRIMARY KEY,
+			role VARCHAR(50) NOT NULL,
+			message TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS ai_notes (
+			id SERIAL PRIMARY KEY,
+			note TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS scheduled_calls (
+			id SERIAL PRIMARY KEY,
+			call_time TIMESTAMP NOT NULL,
+			message TEXT NOT NULL,
+			status VARCHAR(50) DEFAULT 'pending'
+		)`,
+	}
+
+	for _, query := range queries {
+		if _, err := p.conn.Exec(query); err != nil {
+			return fmt.Errorf("failed to execute query %q: %v", query, err)
+		}
+	}
+	return nil
+}
+
+func (p *PostgresDB) GetActiveTasks() ([]models.Task, error) {
+	rows, err := p.conn.Query(`SELECT id, description, status FROM tasks WHERE status = 'pending'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []models.Task
+	for rows.Next() {
+		var t models.Task
+		var idInt int
+		if err := rows.Scan(&idInt, &t.Description, &t.Status); err != nil {
+			return nil, err
+		}
+		t.ID = fmt.Sprintf("%d", idInt)
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
+
+func (p *PostgresDB) GetLastMessages(limit int) ([]models.ChatMessage, error) {
+	query := fmt.Sprintf(`SELECT role, message FROM chat_logs ORDER BY created_at DESC LIMIT %d`, limit)
+	rows, err := p.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []models.ChatMessage
+	for rows.Next() {
+		var m models.ChatMessage
+		if err := rows.Scan(&m.Role, &m.Message); err != nil {
+			return nil, err
+		}
+		messages = append([]models.ChatMessage{m}, messages...) // Prepend so older messages are first
+	}
+	return messages, nil
+}
+
+func (p *PostgresDB) GetLastAINote() (string, error) {
+	var note string
+	err := p.conn.QueryRow(`SELECT note FROM ai_notes ORDER BY created_at DESC LIMIT 1`).Scan(&note)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil // No notes yet
+		}
+		return "", err
+	}
+	return note, nil
+}
+
+func (p *PostgresDB) SaveNote(note string) error {
+	_, err := p.conn.Exec(`INSERT INTO ai_notes (note) VALUES ($1)`, note)
+	return err
+}
+
+func (p *PostgresDB) LogMessage(role, message string) error {
+	_, err := p.conn.Exec(`INSERT INTO chat_logs (role, message) VALUES ($1, $2)`, role, message)
+	return err
+}
+
+func (p *PostgresDB) MarkTasksCompleted(taskIDs []string) error {
+	if len(taskIDs) == 0 {
+		return nil
+	}
+	for _, id := range taskIDs {
+		_, err := p.conn.Exec(`UPDATE tasks SET status = 'completed' WHERE id = $1`, id)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AddTask is a helper to insert a task easily
+func (p *PostgresDB) AddTask(description string) error {
+	_, err := p.conn.Exec(`INSERT INTO tasks (description) VALUES ($1)`, description)
+	return err
+}
+
+func (p *PostgresDB) AddScheduledCall(callTime, message string) error {
+	t, err := time.Parse(time.RFC3339, callTime)
+	if err != nil {
+		// Fallback to string insert if parsing fails
+		_, err = p.conn.Exec(`INSERT INTO scheduled_calls (call_time, message) VALUES ($1, $2)`, callTime, message)
+		return err
+	}
+	// Use Go's time.Time which the pq driver converts to a safe timestamp
+	_, err = p.conn.Exec(`INSERT INTO scheduled_calls (call_time, message) VALUES ($1, $2)`, t, message)
+	return err
+}
+
+type CallRecord struct {
+	ID      int
+	Message string
+}
+
+func (p *PostgresDB) GetPendingCalls() ([]CallRecord, error) {
+	// Pass time.Now() directly to bypass Postgres timezone idiosyncrasies
+	rows, err := p.conn.Query(`SELECT id, message FROM scheduled_calls WHERE status = 'pending' AND call_time <= $1`, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var calls []CallRecord
+	for rows.Next() {
+		var c CallRecord
+		if err := rows.Scan(&c.ID, &c.Message); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, nil
+}
+
+func (p *PostgresDB) MarkCallCompleted(id int) error {
+	_, err := p.conn.Exec(`UPDATE scheduled_calls SET status = 'completed' WHERE id = $1`, id)
+	return err
+}
+
+func (p *PostgresDB) MarkCallFailed(id int) error {
+	_, err := p.conn.Exec(`UPDATE scheduled_calls SET status = 'failed' WHERE id = $1`, id)
+	return err
+}
+
+func (p *PostgresDB) CancelScheduledCalls(callIDs []int) error {
+	if len(callIDs) == 0 {
+		return nil
+	}
+	for _, id := range callIDs {
+		_, err := p.conn.Exec(`UPDATE scheduled_calls SET status = 'cancelled' WHERE id = $1`, id)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type ScheduledCallRecord struct {
+	ID       int
+	CallTime time.Time
+	Message  string
+}
+
+func (p *PostgresDB) GetAllPendingCalls() ([]ScheduledCallRecord, error) {
+	rows, err := p.conn.Query(`SELECT id, call_time, message FROM scheduled_calls WHERE status = 'pending' ORDER BY call_time ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var calls []ScheduledCallRecord
+	for rows.Next() {
+		var c ScheduledCallRecord
+		if err := rows.Scan(&c.ID, &c.CallTime, &c.Message); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, nil
+}
