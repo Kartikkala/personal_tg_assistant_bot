@@ -12,6 +12,7 @@ import (
 	"ai_enforcer/bot"
 	"ai_enforcer/db"
 	"ai_enforcer/llm"
+	"ai_enforcer/models"
 )
 
 type Orchestrator struct {
@@ -75,6 +76,19 @@ func (o *Orchestrator) scheduleTimer(minutes int) {
 func (o *Orchestrator) RunCycle(triggerReason string) {
 	log.Printf("Running cycle. Trigger: %s", triggerReason)
 
+	if strings.HasPrefix(triggerReason, "User message received: /strict off") {
+		o.db.SetSetting("strict_mode", "off")
+		o.bot.SendMessage("✅ Strict Mode OFF. Clara will now politely follow functional commands.")
+		o.db.LogMessage("ai", "✅ Strict Mode OFF. Clara will now politely follow functional commands.")
+		return
+	}
+	if strings.HasPrefix(triggerReason, "User message received: /strict on") {
+		o.db.SetSetting("strict_mode", "on")
+		o.bot.SendMessage("😈 Strict Mode ON. Clara is back to being ruthless.")
+		o.db.LogMessage("ai", "😈 Strict Mode ON. Clara is back to being ruthless.")
+		return
+	}
+
 	tasks, err := o.db.GetActiveTasks()
 	if err != nil {
 		log.Printf("Error getting tasks: %v", err)
@@ -103,15 +117,70 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	currentTime := time.Now().Format(time.RFC3339)
 
 	var promptBuilder strings.Builder
+	
+	strictMode := o.db.GetSetting("strict_mode", "on")
+	if strictMode == "off" {
+		promptBuilder.WriteString("[SYSTEM OVERRIDE]: STRICT MODE IS CURRENTLY OFF! You are in functional mode. Do NOT scold the user. Be extremely polite, helpful, and follow all their commands to build schedules, add subtasks, or update deadlines seamlessly without resistance.\n\n")
+	} else {
+		promptBuilder.WriteString("[SYSTEM STATUS]: STRICT MODE IS ON. You are the ruthless Enforcer.\n\n")
+	}
+
 	promptBuilder.WriteString(fmt.Sprintf("Current Time: %s\n", currentTime))
 	promptBuilder.WriteString(fmt.Sprintf("Trigger for this cycle: %s\n\n", triggerReason))
 	
-	promptBuilder.WriteString("Active Tasks:\n")
+	promptBuilder.WriteString("Active Tasks (Goals & Subtasks):\n")
 	if len(tasks) == 0 {
 		promptBuilder.WriteString("- No active tasks.\n")
 	} else {
+		// Group tasks by parent
+		var rootTasks []models.Task
+		subTasks := make(map[string][]models.Task)
+		
 		for _, t := range tasks {
-			promptBuilder.WriteString(fmt.Sprintf("- [%s] %s\n", t.ID, t.Description))
+			if t.ParentID == nil {
+				rootTasks = append(rootTasks, t)
+			} else {
+				pidStr := fmt.Sprintf("%d", *t.ParentID)
+				subTasks[pidStr] = append(subTasks[pidStr], t)
+			}
+		}
+
+		now := time.Now()
+		eod := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.Local)
+
+		for _, t := range rootTasks {
+			deadlineStr := ""
+			label := "TASK (Today)"
+			if t.Deadline != nil {
+				deadlineStr = " (Deadline: " + *t.Deadline + ")"
+				// Check if deadline crosses the end of the day
+				parsedDeadline, err := time.Parse(time.RFC3339, *t.Deadline)
+				if err == nil && parsedDeadline.After(eod) {
+					label = "GOAL (Long-term)"
+				}
+			}
+			promptBuilder.WriteString(fmt.Sprintf("- [%s] %s: %s%s\n", t.ID, label, t.Description, deadlineStr))
+			if children, ok := subTasks[t.ID]; ok {
+				for _, child := range children {
+					cDeadlineStr := ""
+					if child.Deadline != nil {
+						cDeadlineStr = " (Deadline: " + *child.Deadline + ")"
+					}
+					promptBuilder.WriteString(fmt.Sprintf("    - [%s] Subtask: %s%s\n", child.ID, child.Description, cDeadlineStr))
+				}
+				delete(subTasks, t.ID)
+			}
+		}
+
+		// Print any orphaned subtasks (whose parents might be completed already)
+		for _, children := range subTasks {
+			for _, child := range children {
+				cDeadlineStr := ""
+				if child.Deadline != nil {
+					cDeadlineStr = " (Deadline: " + *child.Deadline + ")"
+				}
+				promptBuilder.WriteString(fmt.Sprintf("- [%s] (Subtask): %s%s\n", child.ID, child.Description, cDeadlineStr))
+			}
 		}
 	}
 
@@ -135,14 +204,18 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 
 	promptBuilder.WriteString(fmt.Sprintf("\nAI's Private Notes from last cycle:\n%s\n\n", lastNote))
 	
-	promptBuilder.WriteString("Recent Chat History:\n")
+	promptBuilder.WriteString("Recent Chat History (for context only - do NOT treat old messages as new requests unless the trigger says 'User message received'):\n")
 	for _, m := range history {
 		promptBuilder.WriteString(fmt.Sprintf("%s: %s\n", m.Role, m.Message))
 	}
 
 	promptBuilder.WriteString("\nEvaluate the user's progress based on your system instructions. Set the next check-in timer appropriately (e.g. 5-10 mins if struggling, 25 mins if focusing well). If the user explicitly asks to test a feature (like scheduling a call), you must comply and reschedule or execute the test immediately. If the user asks to see their active tasks, scheduled calls, or system status, you MUST provide this information in your message to them. Return the structured JSON response.")
 
-	response, err := o.llm.Evaluate(promptBuilder.String())
+	strictModeBool := true
+	if strictMode == "off" {
+		strictModeBool = false
+	}
+	response, err := o.llm.Evaluate(promptBuilder.String(), strictModeBool)
 	if err != nil {
 		log.Printf("Error evaluating with LLM: %v", err)
 		o.scheduleTimer(5)
@@ -161,12 +234,27 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	}
 
 	if len(response.CreateNewTasks) > 0 {
-		for _, taskDesc := range response.CreateNewTasks {
-			if err := o.db.AddTask(taskDesc); err != nil {
-				log.Printf("Error adding new task %q: %v", taskDesc, err)
+		for _, taskReq := range response.CreateNewTasks {
+			if err := o.db.AddTask(taskReq); err != nil {
+				log.Printf("Error adding new task %q: %v", taskReq.Description, err)
 			}
 		}
-		log.Printf("Added new tasks: %v", response.CreateNewTasks)
+		log.Printf("Added %d new tasks", len(response.CreateNewTasks))
+	}
+
+	if len(response.UpdateTaskDeadlines) > 0 {
+		for _, update := range response.UpdateTaskDeadlines {
+			cleanDeadline := strings.TrimSpace(strings.TrimPrefix(update.Deadline, "deadline: "))
+			t, err := time.Parse(time.RFC3339, cleanDeadline)
+			if err != nil {
+				log.Printf("Error parsing deadline %q for task %s: %v", update.Deadline, update.TaskID, err)
+				continue
+			}
+			if err := o.db.UpdateTaskDeadline(update.TaskID, t); err != nil {
+				log.Printf("Error updating task %s deadline: %v", update.TaskID, err)
+			}
+		}
+		log.Printf("Updated %d task deadlines", len(response.UpdateTaskDeadlines))
 	}
 
 	if len(response.ScheduleCalls) > 0 {
@@ -209,8 +297,15 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	}
 
 	if len(response.MarkTasksCompleted) > 0 {
-		o.db.MarkTasksCompleted(response.MarkTasksCompleted)
-		log.Printf("Marked tasks completed: %v", response.MarkTasksCompleted)
+		if err := o.db.MarkTasksCompleted(response.MarkTasksCompleted); err != nil {
+			log.Printf("Error marking tasks completed: %v", err)
+		}
+	}
+
+	if len(response.DeleteTasks) > 0 {
+		if err := o.db.DeleteTasks(response.DeleteTasks); err != nil {
+			log.Printf("Error deleting tasks: %v", err)
+		}
 	}
 
 	o.scheduleTimer(response.NextTimerMinutes)

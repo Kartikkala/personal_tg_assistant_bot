@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -36,8 +37,12 @@ func (p *PostgresDB) initTables() error {
 			id SERIAL PRIMARY KEY,
 			description TEXT NOT NULL,
 			status VARCHAR(50) DEFAULT 'pending',
+			parent_id INT REFERENCES tasks(id) ON DELETE CASCADE,
+			deadline TIMESTAMPTZ,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES tasks(id) ON DELETE CASCADE`,
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS chat_logs (
 			id SERIAL PRIMARY KEY,
 			role VARCHAR(50) NOT NULL,
@@ -57,11 +62,15 @@ func (p *PostgresDB) initTables() error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS recurring_calls (
 			id SERIAL PRIMARY KEY,
-			start_time TIMESTAMP NOT NULL,
+			start_time TIMESTAMPTZ NOT NULL,
 			interval_minutes INT NOT NULL,
 			message TEXT NOT NULL,
-			last_fired TIMESTAMP,
+			last_fired TIMESTAMPTZ,
 			status VARCHAR(50) DEFAULT 'active'
+		)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key VARCHAR(50) PRIMARY KEY,
+			value VARCHAR(255) NOT NULL
 		)`,
 	}
 
@@ -74,7 +83,7 @@ func (p *PostgresDB) initTables() error {
 }
 
 func (p *PostgresDB) GetActiveTasks() ([]models.Task, error) {
-	rows, err := p.conn.Query(`SELECT id, description, status FROM tasks WHERE status = 'pending'`)
+	rows, err := p.conn.Query(`SELECT id, description, status, parent_id, deadline FROM tasks WHERE status = 'pending'`)
 	if err != nil {
 		return nil, err
 	}
@@ -84,10 +93,23 @@ func (p *PostgresDB) GetActiveTasks() ([]models.Task, error) {
 	for rows.Next() {
 		var t models.Task
 		var idInt int
-		if err := rows.Scan(&idInt, &t.Description, &t.Status); err != nil {
+		var parentID sql.NullInt64
+		var deadlineTime sql.NullTime
+
+		if err := rows.Scan(&idInt, &t.Description, &t.Status, &parentID, &deadlineTime); err != nil {
 			return nil, err
 		}
 		t.ID = fmt.Sprintf("%d", idInt)
+		if parentID.Valid {
+			pid := int(parentID.Int64)
+			t.ParentID = &pid
+		}
+		if deadlineTime.Valid {
+			// Convert TIMESTAMPTZ to Local and format
+			localTime := deadlineTime.Time.Local()
+			timeStr := localTime.Format(time.RFC3339)
+			t.Deadline = &timeStr
+		}
 		tasks = append(tasks, t)
 	}
 	return tasks, nil
@@ -110,6 +132,23 @@ func (p *PostgresDB) GetLastMessages(limit int) ([]models.ChatMessage, error) {
 		messages = append([]models.ChatMessage{m}, messages...) // Prepend so older messages are first
 	}
 	return messages, nil
+}
+
+func (p *PostgresDB) SetSetting(key, value string) error {
+	_, err := p.conn.Exec(`
+		INSERT INTO settings (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+	`, key, value)
+	return err
+}
+
+func (p *PostgresDB) GetSetting(key, defaultValue string) string {
+	var value string
+	err := p.conn.QueryRow(`SELECT value FROM settings WHERE key = $1`, key).Scan(&value)
+	if err != nil {
+		return defaultValue
+	}
+	return value
 }
 
 func (p *PostgresDB) GetLastAINote() (string, error) {
@@ -147,9 +186,48 @@ func (p *PostgresDB) MarkTasksCompleted(taskIDs []string) error {
 	return nil
 }
 
+func (p *PostgresDB) DeleteTasks(taskIDs []string) error {
+	if len(taskIDs) == 0 {
+		return nil
+	}
+	for _, id := range taskIDs {
+		_, err := p.conn.Exec(`DELETE FROM tasks WHERE id = $1`, id)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // AddTask is a helper to insert a task easily
-func (p *PostgresDB) AddTask(description string) error {
-	_, err := p.conn.Exec(`INSERT INTO tasks (description) VALUES ($1)`, description)
+func (p *PostgresDB) AddTask(task models.NewTaskRequest) error {
+	var deadlineTime *time.Time
+	if task.Deadline != nil {
+		cleanDeadline := strings.TrimSpace(strings.TrimPrefix(*task.Deadline, "deadline: "))
+		t, err := time.Parse(time.RFC3339, cleanDeadline)
+		if err != nil {
+			return err
+		}
+		deadlineTime = &t
+	}
+	
+	var insertedID int
+	err := p.conn.QueryRow(`INSERT INTO tasks (description, parent_id, deadline) VALUES ($1, $2, $3) RETURNING id`, task.Description, task.ParentID, deadlineTime).Scan(&insertedID)
+	if err != nil {
+		return err
+	}
+
+	for _, subtask := range task.Subtasks {
+		subtask.ParentID = &insertedID
+		if err := p.AddTask(subtask); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *PostgresDB) UpdateTaskDeadline(taskID string, deadline time.Time) error {
+	_, err := p.conn.Exec(`UPDATE tasks SET deadline = $1 WHERE id = $2`, deadline, taskID)
 	return err
 }
 
