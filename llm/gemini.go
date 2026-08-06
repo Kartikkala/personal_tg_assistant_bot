@@ -20,7 +20,7 @@ type GeminiClient struct {
 
 const commonTaskRules = `
 # Task Management & Deadlines
-- If the user asks to update a deadline, use the update_task_deadlines function.
+- If the user asks to recalculate, reschedule, or update a deadline, YOU MUST use the update_task_deadlines function to reflect the changes in the database. Do not just output a new schedule in text without actually calling the function!
 - If the user explicitly asks to DELETE, cancel, or remove a task, YOU MUST use the delete_tasks function. Due to cascading deletes, deleting a parent goal will automatically delete all of its subtasks.
 - If the user finishes a task, use mark_tasks_completed. Do not delete completed tasks.
 - If you use delete_tasks or mark_tasks_completed on a task, DO NOT use update_task_deadlines on it.
@@ -29,12 +29,13 @@ const commonTaskRules = `
 - When creating tasks, use realistic deadlines based on your own judgment. For example, a shower shouldn't take more than 25 minutes. A study session can be a few hours. If the user says "by EOD", use 23:59:59 of the current day.
 - Break down large goals automatically. If the user asks you to generate a syllabus, a table of contents, or a list of subtasks for a topic (like RxJS or Angular), YOU MUST DO IT. It is NOT a distraction.
 - NESTED SUBTASKS RULE: When creating a NEW parent goal and breaking it down into subtasks in the SAME cycle, you MUST use the nested 'subtasks' array inside the parent task object. DO NOT create them as separate flat tasks with a fabricated 'parent_id', because you don't know the generated ID of the parent yet!
-- SCHEDULING ENGINE: When assigning deadlines to tasks or subtasks, you MUST calculate mathematically sound, chronological deadlines. 
-    1. Estimate the optimized time required for each topic (e.g., 15-20 mins for simple topics, up to 1 hr for complex ones).
-    2. Respect the user's default working hours: 9:00 AM to 7:00 PM.
-    3. You MUST completely avoid scheduling tasks during their standard breaks: Breakfast (9:30 AM - 10:30 AM), Lunch (2:00 PM - 3:15 PM), and Dinner (9:15 PM - 10:10 PM). 
-    4. If a task hits a break boundary, pause and schedule it to finish after the break.
-    5. Prioritize user-provided custom constraints over the defaults.
+- SCHEDULING ENGINE: When assigning or recalculating deadlines, you MUST calculate mathematically sound, chronological deadlines. 
+    1. Deadlines are COMPLETION TIMES, not start times! If the user starts working at 9:30 AM on a 1-hour task, the deadline is 10:30 AM (not 9:30 AM).
+    2. Estimate the optimized time required for each topic (e.g., 15-20 mins for simple topics, up to 1 hr for complex ones) and add that duration to the PREVIOUS task's deadline to get the new deadline.
+    3. Respect the user's default working hours: 9:00 AM to 7:00 PM.
+    4. You MUST completely avoid scheduling tasks during their standard breaks: Breakfast (9:30 AM - 10:30 AM), Lunch (2:00 PM - 3:15 PM), and Dinner (9:15 PM - 10:10 PM). 
+    5. If a calculated deadline overlaps a break boundary, push the deadline to finish after the break.
+    6. Prioritize user-provided custom constraints over the defaults.
 - IMPORTANT BATCHING RULE: If the user asks for a massive list (like a full syllabus) that requires creating more than 5-7 subtasks, DO NOT generate them all at once to avoid API rate limits. Instead, generate the first 5 subtasks, and write a note in 'message_to_self' saying "Generate part 2 of the syllabus". Then, set 'next_timer_minutes' to 1 minute so you can immediately wake up and continue generating the rest of the list in the next cycle. Repeat this until the list is complete.
 `
 
@@ -198,11 +199,12 @@ func NewGeminiClient(apiKey string) (*GeminiClient, error) {
 						},
 						"deadline": {
 							Type:        genai.TypeString,
-							Description: "RFC3339 formatted time string for the new deadline.",
+							Description: "REQUIRED. A purely valid RFC3339 formatted time string for the new deadline. DO NOT prefix with 'deadline:'.",
 						},
 					},
+					Required: []string{"task_id", "deadline"},
 				},
-				Description: "Array of task deadlines to update.",
+				Description: "Array of task deadlines to update. MUST use this if you agree to recalculate or reschedule tasks.",
 			},
 			"mark_tasks_completed": {
 				Type: genai.TypeArray,
