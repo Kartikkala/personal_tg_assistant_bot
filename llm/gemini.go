@@ -91,6 +91,34 @@ Your tone is commanding, strict, and delightfully stubborn. You do not take excu
 				},
 				Description: "Array of scheduled call IDs to cancel (e.g., if the user asks to clear schedules or if they picked up).",
 			},
+			"schedule_recurring_calls": {
+				Type: genai.TypeArray,
+				Items: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"start_time": {
+							Type:        genai.TypeString,
+							Description: "RFC3339 formatted time string for when the alarm loop should begin. MUST MATCH the timezone offset provided.",
+						},
+						"interval_minutes": {
+							Type:        genai.TypeInteger,
+							Description: "How many minutes to wait before calling again (the loop interval).",
+						},
+						"message": {
+							Type:        genai.TypeString,
+							Description: "The message to be read aloud during the recurring calls.",
+						},
+					},
+				},
+				Description: "Array of persistent alarms to schedule. Use this when the user wants you to keep calling them repeatedly on a loop.",
+			},
+			"cancel_recurring_calls": {
+				Type: genai.TypeArray,
+				Items: &genai.Schema{
+					Type: genai.TypeInteger,
+				},
+				Description: "Array of recurring call IDs to cancel. Use this when the user says they woke up or wants to stop the alarm loop.",
+			},
 			"mark_tasks_completed": {
 				Type: genai.TypeArray,
 				Items: &genai.Schema{

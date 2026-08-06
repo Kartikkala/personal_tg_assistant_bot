@@ -95,6 +95,11 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 		log.Printf("Error getting pending calls: %v", err)
 	}
 
+	recurringCalls, err := o.db.GetActiveRecurringCalls()
+	if err != nil {
+		log.Printf("Error getting recurring calls: %v", err)
+	}
+
 	currentTime := time.Now().Format(time.RFC3339)
 
 	var promptBuilder strings.Builder
@@ -116,6 +121,15 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	} else {
 		for _, c := range pendingCalls {
 			promptBuilder.WriteString(fmt.Sprintf("- [ID: %d] Time: %s, Message: %s\n", c.ID, c.CallTime.Format(time.RFC3339), c.Message))
+		}
+	}
+
+	promptBuilder.WriteString("\nRecurring Calls (Persistent Alarms):\n")
+	if len(recurringCalls) == 0 {
+		promptBuilder.WriteString("- No recurring calls.\n")
+	} else {
+		for _, c := range recurringCalls {
+			promptBuilder.WriteString(fmt.Sprintf("- [ID: %d] Starts: %s, Interval (mins): %d, Message: %s\n", c.ID, c.StartTime.Format(time.RFC3339), c.IntervalMinutes, c.Message))
 		}
 	}
 
@@ -172,6 +186,28 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 		}
 	}
 
+	if len(response.ScheduleRecurringCalls) > 0 {
+		for _, call := range response.ScheduleRecurringCalls {
+			startTime, err := time.Parse(time.RFC3339, call.StartTime)
+			if err != nil {
+				log.Printf("Error parsing start_time for recurring call: %v", err)
+				continue
+			}
+			if err := o.db.AddRecurringCall(startTime, call.IntervalMinutes, call.Message); err != nil {
+				log.Printf("Error scheduling recurring call at %s: %v", call.StartTime, err)
+			}
+		}
+		log.Printf("Scheduled recurring calls: %v", response.ScheduleRecurringCalls)
+	}
+
+	if len(response.CancelRecurringCalls) > 0 {
+		if err := o.db.CancelRecurringCalls(response.CancelRecurringCalls); err != nil {
+			log.Printf("Error cancelling recurring calls: %v", err)
+		} else {
+			log.Printf("Cancelled recurring calls: %v", response.CancelRecurringCalls)
+		}
+	}
+
 	if len(response.MarkTasksCompleted) > 0 {
 		o.db.MarkTasksCompleted(response.MarkTasksCompleted)
 		log.Printf("Marked tasks completed: %v", response.MarkTasksCompleted)
@@ -195,37 +231,86 @@ func (o *Orchestrator) callScheduler() {
 
 		for _, call := range calls {
 			log.Printf("Executing scheduled call ID %d to %s", call.ID, o.callMeBotUser)
-			
-			// CallMeBot prefers %20 instead of + for spaces
-			safeMessage := strings.ReplaceAll(url.QueryEscape(call.Message), "+", "%20")
-			apiURL := fmt.Sprintf("http://api.callmebot.com/start.php?source=auth&user=%s&text=%s&lang=en-US-Standard-B", 
-				url.QueryEscape(o.callMeBotUser), 
-				safeMessage)
-			
-			log.Printf("Request URL: %s", apiURL)
-			
-			resp, err := http.Get(apiURL)
-			if err != nil {
-				log.Printf("Error triggering CallMeBot API: %v", err)
-				time.Sleep(65 * time.Second)
-				continue
-			}
-			
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			bodyStr := string(bodyBytes)
-
-			if resp.StatusCode == 200 || strings.Contains(bodyStr, "Starting Telegram Audio Call") || strings.Contains(bodyStr, "Autorization OK") {
-				o.db.MarkCallCompleted(call.ID)
-				log.Printf("Call %d successfully placed.", call.ID)
-			} else {
-				log.Printf("CallMeBot API returned non-200 status: %d. Body: %s", resp.StatusCode, bodyStr)
-				// Mark as failed so it doesn't poison the queue forever
+			if err := o.executeCall(call.Message); err != nil {
+				log.Printf("Call %d failed: %v", call.ID, err)
 				o.db.MarkCallFailed(call.ID)
+			} else {
+				o.db.MarkCallCompleted(call.ID)
+			}
+		}
+
+		// Evaluate recurring calls
+		recurringCalls, err := o.db.GetActiveRecurringCalls()
+		if err != nil {
+			log.Printf("Error checking recurring calls: %v", err)
+			continue
+		}
+
+		now := time.Now()
+		for _, rc := range recurringCalls {
+			// FIX: Postgres 'TIMESTAMP' drops the timezone and 'pq' reads it as UTC.
+			// Force the wall-clock time back to local timezone for accurate comparisons.
+			rc.StartTime = time.Date(rc.StartTime.Year(), rc.StartTime.Month(), rc.StartTime.Day(), rc.StartTime.Hour(), rc.StartTime.Minute(), rc.StartTime.Second(), rc.StartTime.Nanosecond(), time.Local)
+			if rc.LastFired != nil {
+				lf := time.Date(rc.LastFired.Year(), rc.LastFired.Month(), rc.LastFired.Day(), rc.LastFired.Hour(), rc.LastFired.Minute(), rc.LastFired.Second(), rc.LastFired.Nanosecond(), time.Local)
+				rc.LastFired = &lf
 			}
 
-			log.Println("Sleeping for 66 seconds to respect CallMeBot's 65-second rate limit...")
-			time.Sleep(66 * time.Second)
+			if now.Before(rc.StartTime) {
+				continue // Not started yet
+			}
+
+			shouldFire := false
+			if rc.LastFired == nil {
+				shouldFire = true
+			} else {
+				durationSince := now.Sub(*rc.LastFired)
+				if durationSince.Minutes() >= float64(rc.IntervalMinutes) {
+					shouldFire = true
+				}
+			}
+
+			if shouldFire {
+				log.Printf("Executing recurring call ID %d to %s", rc.ID, o.callMeBotUser)
+				if err := o.executeCall(rc.Message); err != nil {
+					log.Printf("Recurring Call %d failed: %v", rc.ID, err)
+				} else {
+					o.db.UpdateRecurringCallLastFired(rc.ID, now)
+				}
+			}
 		}
+	}
+}
+
+func (o *Orchestrator) executeCall(message string) error {
+	// CallMeBot prefers %20 instead of + for spaces
+	safeMessage := strings.ReplaceAll(url.QueryEscape(message), "+", "%20")
+	apiURL := fmt.Sprintf("http://api.callmebot.com/start.php?source=auth&user=%s&text=%s&lang=en-US-Standard-B", 
+		url.QueryEscape(o.callMeBotUser), 
+		safeMessage)
+	
+	log.Printf("Request URL: %s", apiURL)
+	
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		log.Printf("Error triggering CallMeBot API: %v", err)
+		return err
+	}
+	
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	bodyStr := string(bodyBytes)
+
+	if resp.StatusCode == 200 || strings.Contains(bodyStr, "Starting Telegram Audio Call") || strings.Contains(bodyStr, "Autorization OK") {
+		log.Printf("Call successfully placed.")
+		
+		// CallMeBot has a strict rate limit, so we MUST sleep 66 seconds after any successful call to avoid ban
+		log.Println("Sleeping for 66 seconds to respect CallMeBot's 65-second rate limit...")
+		time.Sleep(66 * time.Second)
+		
+		return nil
+	} else {
+		log.Printf("CallMeBot API returned non-200 status: %d. Body: %s", resp.StatusCode, bodyStr)
+		return fmt.Errorf("API failed with status %d", resp.StatusCode)
 	}
 }

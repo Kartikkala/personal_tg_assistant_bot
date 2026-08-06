@@ -55,6 +55,14 @@ func (p *PostgresDB) initTables() error {
 			message TEXT NOT NULL,
 			status VARCHAR(50) DEFAULT 'pending'
 		)`,
+		`CREATE TABLE IF NOT EXISTS recurring_calls (
+			id SERIAL PRIMARY KEY,
+			start_time TIMESTAMP NOT NULL,
+			interval_minutes INT NOT NULL,
+			message TEXT NOT NULL,
+			last_fired TIMESTAMP,
+			status VARCHAR(50) DEFAULT 'active'
+		)`,
 	}
 
 	for _, query := range queries {
@@ -226,4 +234,53 @@ func (p *PostgresDB) GetAllPendingCalls() ([]ScheduledCallRecord, error) {
 		calls = append(calls, c)
 	}
 	return calls, nil
+}
+
+func (p *PostgresDB) AddRecurringCall(startTime time.Time, intervalMinutes int, message string) error {
+	_, err := p.conn.Exec(`INSERT INTO recurring_calls (start_time, interval_minutes, message) VALUES ($1, $2, $3)`, startTime, intervalMinutes, message)
+	return err
+}
+
+type RecurringCallRecord struct {
+	ID              int
+	StartTime       time.Time
+	IntervalMinutes int
+	Message         string
+	LastFired       *time.Time
+}
+
+func (p *PostgresDB) GetActiveRecurringCalls() ([]RecurringCallRecord, error) {
+	rows, err := p.conn.Query(`SELECT id, start_time, interval_minutes, message, last_fired FROM recurring_calls WHERE status = 'active' ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var calls []RecurringCallRecord
+	for rows.Next() {
+		var c RecurringCallRecord
+		if err := rows.Scan(&c.ID, &c.StartTime, &c.IntervalMinutes, &c.Message, &c.LastFired); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, nil
+}
+
+func (p *PostgresDB) UpdateRecurringCallLastFired(id int, lastFired time.Time) error {
+	_, err := p.conn.Exec(`UPDATE recurring_calls SET last_fired = $1 WHERE id = $2`, lastFired, id)
+	return err
+}
+
+func (p *PostgresDB) CancelRecurringCalls(callIDs []int) error {
+	if len(callIDs) == 0 {
+		return nil
+	}
+	for _, id := range callIDs {
+		_, err := p.conn.Exec(`UPDATE recurring_calls SET status = 'cancelled' WHERE id = $1`, id)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
