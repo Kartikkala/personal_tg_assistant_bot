@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 
+	"time"
+
 	"ai_enforcer/bot"
 	"ai_enforcer/db"
 	"ai_enforcer/llm"
@@ -12,6 +14,12 @@ import (
 )
 
 func main() {
+	// Hardcode local timezone to Asia/Kolkata so server restarts don't switch to UTC
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err == nil {
+		time.Local = loc
+	}
+
 	dbConnStr := os.Getenv("DATABASE_URL")
 	if dbConnStr == "" {
 		log.Fatal("DATABASE_URL environment variable is required (e.g. postgres://user:pass@localhost:5432/dbname?sslmode=disable)")
