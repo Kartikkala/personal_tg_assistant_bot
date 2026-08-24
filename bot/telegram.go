@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"strings"
 
@@ -55,6 +56,22 @@ func (b *TelegramBot) StartListening(messageChan chan<- string) {
 			
 			if update.Message.Chat.ID == b.chatID {
 				messageChan <- update.Message.Text
+			}
+		}
+
+		if update.CallbackQuery != nil {
+			if b.chatID == 0 {
+				b.chatID = update.CallbackQuery.Message.Chat.ID
+			}
+			
+			if update.CallbackQuery.Message.Chat.ID == b.chatID {
+				// Acknowledge callback immediately to remove loading state
+				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+				if _, err := b.api.Request(callback); err != nil {
+					log.Printf("Failed to answer callback: %v", err)
+				}
+				
+				messageChan <- "[CALLBACK] " + update.CallbackQuery.Data
 			}
 		}
 	}
@@ -135,4 +152,62 @@ func (b *TelegramBot) SendTypingAction() error {
 
 func (b *TelegramBot) SetChatID(id int64) {
 	b.chatID = id
+}
+
+func (b *TelegramBot) SendQuizQuestion(text string, options []string) (int, error) {
+	if b.chatID == 0 {
+		return 0, nil
+	}
+
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+	for i, opt := range options {
+		data := fmt.Sprintf("quiz_answer_%d", i)
+		btn := tgbotapi.NewInlineKeyboardButtonData(opt, data)
+		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(btn))
+	}
+	skipBtn := tgbotapi.NewInlineKeyboardButtonData("Skip Quiz", "quiz_skip")
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(skipBtn))
+
+	msg := tgbotapi.NewMessage(b.chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(keyboard...)
+	
+	sentMsg, err := b.api.Send(msg)
+	if err != nil {
+		return 0, err
+	}
+	return sentMsg.MessageID, nil
+}
+
+func (b *TelegramBot) EditQuizQuestion(messageID int, text string, options []string) error {
+	if b.chatID == 0 {
+		return nil
+	}
+
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+	for i, opt := range options {
+		data := fmt.Sprintf("quiz_answer_%d", i)
+		btn := tgbotapi.NewInlineKeyboardButtonData(opt, data)
+		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(btn))
+	}
+	skipBtn := tgbotapi.NewInlineKeyboardButtonData("Skip Quiz", "quiz_skip")
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(skipBtn))
+
+	msg := tgbotapi.NewEditMessageText(b.chatID, messageID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	markup := tgbotapi.NewInlineKeyboardMarkup(keyboard...)
+	msg.ReplyMarkup = &markup
+	
+	_, err := b.api.Send(msg)
+	return err
+}
+
+func (b *TelegramBot) EditQuizResult(messageID int, text string) error {
+	if b.chatID == 0 {
+		return nil
+	}
+	msg := tgbotapi.NewEditMessageText(b.chatID, messageID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	_, err := b.api.Send(msg)
+	return err
 }

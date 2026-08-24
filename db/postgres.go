@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -72,6 +73,16 @@ func (p *PostgresDB) initTables() error {
 		`CREATE TABLE IF NOT EXISTS settings (
 			key VARCHAR(50) PRIMARY KEY,
 			value VARCHAR(255) NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS quiz_sessions (
+			session_id SERIAL PRIMARY KEY,
+			task_id INT NOT NULL,
+			questions JSONB NOT NULL,
+			current_index INT DEFAULT 0,
+			correct_answers INT DEFAULT 0,
+			failed_topics JSONB DEFAULT '[]',
+			message_id INT DEFAULT 0,
+			status VARCHAR(50) DEFAULT 'active'
 		)`,
 	}
 
@@ -422,4 +433,40 @@ func (p *PostgresDB) CancelRecurringCalls(callIDs []int) error {
 		}
 	}
 	return nil
+}
+
+func (p *PostgresDB) CreateQuizSession(taskID string, questionsJSON string) (int, error) {
+	var sessionID int
+	err := p.conn.QueryRow(`INSERT INTO quiz_sessions (task_id, questions, status) VALUES ($1, $2, 'active') RETURNING session_id`, taskID, questionsJSON).Scan(&sessionID)
+	return sessionID, err
+}
+
+func (p *PostgresDB) GetActiveQuizSession() (*models.QuizSession, error) {
+	var session models.QuizSession
+	var questionsJSON string
+	var failedTopicsJSON string
+	err := p.conn.QueryRow(`SELECT session_id, task_id, questions, current_index, correct_answers, status, message_id, failed_topics FROM quiz_sessions WHERE status = 'active' LIMIT 1`).
+		Scan(&session.SessionID, &session.TaskID, &questionsJSON, &session.CurrentIndex, &session.CorrectAnswers, &session.Status, &session.MessageID, &failedTopicsJSON)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // No active session
+		}
+		return nil, err
+	}
+	
+	if err := json.Unmarshal([]byte(questionsJSON), &session.Questions); err != nil {
+		return nil, fmt.Errorf("failed to parse questions JSON: %v", err)
+	}
+	return &session, nil
+}
+
+func (p *PostgresDB) UpdateQuizSession(sessionID int, currentIndex, correctAnswers, messageID int, status, failedTopicsJSON string) error {
+	_, err := p.conn.Exec(`UPDATE quiz_sessions SET current_index = $1, correct_answers = $2, message_id = $3, status = $4, failed_topics = $5 WHERE session_id = $6`,
+		currentIndex, correctAnswers, messageID, status, failedTopicsJSON, sessionID)
+	return err
+}
+
+func (p *PostgresDB) DeleteQuizSession(sessionID int) error {
+	_, err := p.conn.Exec(`DELETE FROM quiz_sessions WHERE session_id = $1`, sessionID)
+	return err
 }

@@ -12,6 +12,7 @@ type AIResponse struct {
 	CancelRecurringCalls   []int                `json:"cancel_recurring_calls"`
 	UpdateTaskDeadlines    []UpdateTaskDeadline `json:"update_task_deadlines"`
 	NextTimerMinutes       int                  `json:"next_timer_minutes"`
+	SkipQuizRequested      bool                 `json:"skip_quiz_requested"`
 }
 
 type UpdateTaskDeadline struct {
@@ -49,3 +50,32 @@ type ChatMessage struct {
 	Role    string `json:"role"`    // "user", "ai"
 	Message string `json:"message"`
 }
+
+type QuizQuestion struct {
+	Question     string   `json:"question"`
+	Options      []string `json:"options"`
+	CorrectIndex int      `json:"correct_index"`
+	Explanation  string   `json:"explanation"`
+	IsCoding     bool     `json:"is_coding"`
+}
+
+type QuizSession struct {
+	SessionID      int            `json:"session_id"`
+	TaskID         string         `json:"task_id"`
+	Questions      []QuizQuestion `json:"questions"`
+	CurrentIndex   int            `json:"current_index"`
+	CorrectAnswers int            `json:"correct_answers"`
+	Status         string         `json:"status"` // "active", "completed"
+	MessageID      int            `json:"message_id"` // Telegram message ID of the active quiz to edit it
+}
+
+type QuizGenerationResponse struct {
+	Questions []QuizQuestion `json:"questions"`
+}
+
+type QuizAnalysisResponse struct {
+	MessageToUser  string           `json:"message_to_user"`
+	Passed         bool             `json:"passed"`
+	CreateNewTasks []NewTaskRequest `json:"create_new_tasks"`
+}
+

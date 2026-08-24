@@ -43,6 +43,12 @@ func (o *Orchestrator) Start(messageChan <-chan string) {
 	for {
 		select {
 		case msg := <-messageChan:
+			if strings.HasPrefix(msg, "[CALLBACK] ") {
+				data := strings.TrimPrefix(msg, "[CALLBACK] ")
+				go o.handleQuizCallback(data)
+				continue
+			}
+
 			log.Printf("Received message from user: %s", msg)
 			o.db.LogMessage("user", msg)
 			
@@ -87,6 +93,15 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 		o.db.SetSetting("strict_mode", "on")
 		o.bot.SendMessage("😈 Strict Mode ON. Clara is back to being ruthless.")
 		o.db.LogMessage("ai", "😈 Strict Mode ON. Clara is back to being ruthless.")
+		return
+	}
+	if strings.HasPrefix(triggerReason, "User message received: /difficulty ") {
+		parts := strings.SplitN(triggerReason, " ", 5)
+		if len(parts) >= 5 {
+			level := strings.TrimSpace(parts[4])
+			o.db.SetSetting("quiz_difficulty", level)
+			o.bot.SendMessage("⚙️ Default quiz difficulty set to: " + level)
+		}
 		return
 	}
 	if strings.HasPrefix(triggerReason, "User message received: /tasks") {
@@ -318,8 +333,14 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	}
 
 	if len(response.MarkTasksCompleted) > 0 {
-		if err := o.db.MarkTasksCompleted(response.MarkTasksCompleted); err != nil {
-			log.Printf("Error marking tasks completed: %v", err)
+		if !response.SkipQuizRequested {
+			// Trigger a quiz for the first task instead of completing directly
+			go o.StartQuiz(response.MarkTasksCompleted[0])
+			// Drop the rest of the completions if they exist, force user to quiz one at a time to prevent skipping
+		} else {
+			if err := o.db.MarkTasksCompleted(response.MarkTasksCompleted); err != nil {
+				log.Printf("Error marking tasks completed: %v", err)
+			}
 		}
 	}
 
