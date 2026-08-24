@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"html"
 	"log"
 	"strings"
 	"time"
@@ -88,8 +89,12 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 		o.db.LogMessage("ai", "😈 Strict Mode ON. Clara is back to being ruthless.")
 		return
 	}
+	if strings.HasPrefix(triggerReason, "User message received: /tasks") {
+		o.handleTasksCommand()
+		return
+	}
 
-	tasks, err := o.db.GetActiveTasks()
+	tasks, err := o.db.GetRelevantTasksForLLM()
 	if err != nil {
 		log.Printf("Error getting tasks: %v", err)
 	}
@@ -215,7 +220,23 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	if strictMode == "off" {
 		strictModeBool = false
 	}
-	response, err := o.llm.Evaluate(promptBuilder.String(), strictModeBool)
+	doneTyping := make(chan bool)
+	go func() {
+		o.bot.SendTypingAction()
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-doneTyping:
+				return
+			case <-ticker.C:
+				o.bot.SendTypingAction()
+			}
+		}
+	}()
+
+	response, err := o.llm.Evaluate(promptBuilder.String(), strictModeBool, triggerReason)
+	close(doneTyping)
 	if err != nil {
 		log.Printf("Error evaluating with LLM: %v", err)
 		o.scheduleTimer(5)
@@ -408,4 +429,98 @@ func (o *Orchestrator) executeCall(message string) error {
 		log.Printf("CallMeBot API returned non-200 status: %d. Body: %s", resp.StatusCode, bodyStr)
 		return fmt.Errorf("API failed with status %d", resp.StatusCode)
 	}
+}
+
+func (o *Orchestrator) handleTasksCommand() {
+	tasks, err := o.db.GetActiveTasks()
+	if err != nil {
+		log.Printf("Error getting tasks: %v", err)
+		o.bot.SendMessage("❌ Error fetching tasks.")
+		return
+	}
+
+	if len(tasks) == 0 {
+		o.bot.SendMessage("📋 No active tasks. You're all clear!")
+		return
+	}
+
+	var rootTasks []models.Task
+	subTasks := make(map[string][]models.Task)
+
+	for _, t := range tasks {
+		if t.ParentID == nil {
+			rootTasks = append(rootTasks, t)
+		} else {
+			pidStr := fmt.Sprintf("%d", *t.ParentID)
+			subTasks[pidStr] = append(subTasks[pidStr], t)
+		}
+	}
+
+	now := time.Now()
+	eod := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.Local)
+
+	var msg strings.Builder
+	msg.WriteString("📋 <b>Active Tasks</b>\n\n")
+
+	for _, t := range rootTasks {
+		icon := "📌"
+		deadlineInfo := ""
+		if t.Deadline != nil {
+			parsedDeadline, err := time.Parse(time.RFC3339, *t.Deadline)
+			if err == nil {
+				if parsedDeadline.After(eod) {
+					icon = "🎯"
+					deadlineInfo = fmt.Sprintf(" <i>(due %s)</i>", parsedDeadline.Format("Jan 02"))
+				} else if parsedDeadline.Before(now) {
+					icon = "🔴"
+					deadlineInfo = " ⚠️ <b>OVERDUE</b>"
+				} else {
+					deadlineInfo = fmt.Sprintf(" <i>(by %s)</i>", parsedDeadline.Format("3:04 PM"))
+				}
+			}
+		}
+
+		desc := html.EscapeString(t.Description)
+		msg.WriteString(fmt.Sprintf("%s <b>%s</b>%s <code>[#%s]</code>\n", icon, desc, deadlineInfo, t.ID))
+
+		if children, ok := subTasks[t.ID]; ok {
+			for _, child := range children {
+				childDeadline := ""
+				childIcon := "  ├─"
+				if child.Deadline != nil {
+					pd, err := time.Parse(time.RFC3339, *child.Deadline)
+					if err == nil {
+						if pd.Before(now) {
+							childDeadline = " ⚠️ OVERDUE"
+						} else {
+							childDeadline = fmt.Sprintf(" <i>%s</i>", pd.Format("Jan 02, 3:04 PM"))
+						}
+					}
+				}
+				childDesc := html.EscapeString(child.Description)
+				msg.WriteString(fmt.Sprintf("%s %s%s <code>[#%s]</code>\n", childIcon, childDesc, childDeadline, child.ID))
+			}
+			delete(subTasks, t.ID)
+		}
+		msg.WriteString("\n")
+	}
+
+	// Orphaned subtasks
+	for _, children := range subTasks {
+		for _, child := range children {
+			childDeadline := ""
+			if child.Deadline != nil {
+				pd, err := time.Parse(time.RFC3339, *child.Deadline)
+				if err == nil {
+					childDeadline = fmt.Sprintf(" <i>%s</i>", pd.Format("Jan 02, 3:04 PM"))
+				}
+			}
+			childDesc := html.EscapeString(child.Description)
+			msg.WriteString(fmt.Sprintf("📎 %s%s <code>[#%s]</code>\n", childDesc, childDeadline, child.ID))
+		}
+	}
+
+	msg.WriteString(fmt.Sprintf("─────────────\n📊 Total: <b>%d tasks</b>", len(tasks)))
+
+	o.bot.SendMessageHTML(msg.String())
 }

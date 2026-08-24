@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -115,6 +116,43 @@ func (p *PostgresDB) GetActiveTasks() ([]models.Task, error) {
 	return tasks, nil
 }
 
+// GetRelevantTasksForLLM fetches only tasks that are immediate (overdue, due today, or due tomorrow) 
+// or have no deadline (like broad goals). This prevents feeding the LLM 200+ future tasks.
+func (p *PostgresDB) GetRelevantTasksForLLM() ([]models.Task, error) {
+	now := time.Now()
+	tomorrowEOD := time.Date(now.Year(), now.Month(), now.Day()+1, 23, 59, 59, 0, time.Local)
+
+	rows, err := p.conn.Query(`SELECT id, description, status, parent_id, deadline FROM tasks WHERE status = 'pending' AND (deadline IS NULL OR deadline <= $1)`, tomorrowEOD)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []models.Task
+	for rows.Next() {
+		var t models.Task
+		var idInt int
+		var parentID sql.NullInt64
+		var deadlineTime sql.NullTime
+
+		if err := rows.Scan(&idInt, &t.Description, &t.Status, &parentID, &deadlineTime); err != nil {
+			return nil, err
+		}
+		t.ID = fmt.Sprintf("%d", idInt)
+		if parentID.Valid {
+			pid := int(parentID.Int64)
+			t.ParentID = &pid
+		}
+		if deadlineTime.Valid {
+			localTime := deadlineTime.Time.Local()
+			timeStr := localTime.Format(time.RFC3339)
+			t.Deadline = &timeStr
+		}
+		tasks = append(tasks, t)
+	}
+	return tasks, nil
+}
+
 func (p *PostgresDB) GetLastMessages(limit int) ([]models.ChatMessage, error) {
 	query := fmt.Sprintf(`SELECT role, message FROM chat_logs ORDER BY created_at DESC LIMIT %d`, limit)
 	rows, err := p.conn.Query(query)
@@ -204,11 +242,34 @@ func (p *PostgresDB) AddTask(task models.NewTaskRequest) error {
 	var deadlineTime *time.Time
 	if task.Deadline != nil {
 		cleanDeadline := strings.TrimSpace(strings.TrimPrefix(*task.Deadline, "deadline: "))
-		t, err := time.Parse(time.RFC3339, cleanDeadline)
-		if err != nil {
-			return err
+		// Sanitize common LLM timezone garbage (e.g., "+0H+05:30" -> "+05:30")
+		// Strip anything between the last 'T...' time and a valid +HH:MM or Z suffix
+		if idx := strings.LastIndex(cleanDeadline, "+0H"); idx != -1 {
+			cleanDeadline = cleanDeadline[:idx] + cleanDeadline[idx+3:]
 		}
-		deadlineTime = &t
+		if idx := strings.LastIndex(cleanDeadline, "+0h"); idx != -1 {
+			cleanDeadline = cleanDeadline[:idx] + cleanDeadline[idx+3:]
+		}
+		
+		var t time.Time
+		var err error
+		formats := []string{
+			time.RFC3339,
+			"2006-01-02T15:04:05-07:00",
+			"2006-01-02T15:04:05",
+			"2006-01-02",
+		}
+		for _, f := range formats {
+			t, err = time.Parse(f, cleanDeadline)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			log.Printf("Warning: could not parse deadline %q, skipping: %v", *task.Deadline, err)
+		} else {
+			deadlineTime = &t
+		}
 	}
 	
 	var insertedID int

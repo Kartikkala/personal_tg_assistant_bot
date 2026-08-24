@@ -13,9 +13,15 @@ import (
 	"ai_enforcer/models"
 )
 
+type roadmapModelEntry struct {
+	model *genai.GenerativeModel
+	name  string
+}
+
 type GeminiClient struct {
-	client *genai.Client
-	model  *genai.GenerativeModel
+	client        *genai.Client
+	defaultModel  *genai.GenerativeModel
+	roadmapModels []roadmapModelEntry
 }
 
 const commonTaskRules = `
@@ -36,7 +42,13 @@ const commonTaskRules = `
     4. You MUST completely avoid scheduling tasks during their standard breaks: Breakfast (9:30 AM - 10:30 AM), Lunch (2:00 PM - 3:15 PM), and Dinner (9:15 PM - 10:10 PM). 
     5. If a calculated deadline overlaps a break boundary, push the deadline to finish after the break.
     6. Prioritize user-provided custom constraints over the defaults.
-- IMPORTANT BATCHING RULE: If the user asks for a massive list (like a full syllabus) that requires creating more than 5-7 subtasks, DO NOT generate them all at once to avoid API rate limits. Instead, generate the first 5 subtasks, and write a note in 'message_to_self' saying "Generate part 2 of the syllabus". Then, set 'next_timer_minutes' to 1 minute so you can immediately wake up and continue generating the rest of the list in the next cycle. Repeat this until the list is complete.
+- SINGLE-PASS ROADMAP RULE: If the user uses the /goal command or asks for a syllabus/roadmap, you MUST generate an EXHAUSTIVE, chapter-by-chapter breakdown using the 'create_new_tasks' JSON array. Follow these rules STRICTLY:
+    1. DO NOT summarize the roadmap in 'message_to_user'. The roadmap lives ENTIRELY in the 'create_new_tasks' array as structured data. Your 'message_to_user' should only be a short confirmation like 'Done! Your roadmap is ready. Use /tasks to view it.'
+    2. DO NOT create '5 phases' or '6 modules'. Instead, create 20-30+ individual parent tasks, one for each CHAPTER or TOPIC AREA (e.g., 'Chapter 1: Python Variables & Data Types', 'Chapter 2: Control Flow', 'Chapter 3: Functions & Scope', etc).
+    3. Each chapter (parent task) MUST have 5-10 granular subtasks inside its 'subtasks' array. Each subtask should be a specific, actionable lesson (e.g., 'Practice list comprehensions with 5 exercises', 'Build a simple CSV parser using pandas').
+    4. The total number of tasks+subtasks should be 100-300+ for a multi-week roadmap. You have a 65k+ token output limit. USE IT.
+    5. Every single subtask MUST have its own individual deadline calculated using the SCHEDULING ENGINE rules.
+- LENIENT TIME-BLOCKING: When estimating time for topics in a roadmap, be highly lenient and intelligent. Give more than enough time for each topic so the user isn't rushed. Account for all work hours and breaks strictly.
 `
 
 const strictSystemInstruction = `You are a relentless, unyielding AI Accountability Enforcer specifically designed to keep a user with ADHD entirely on track. 
@@ -80,12 +92,10 @@ func NewGeminiClient(apiKey string) (*GeminiClient, error) {
 		return nil, err
 	}
 
-	model := client.GenerativeModel("gemma-4-31b-it")
-	model.ResponseMIMEType = "application/json"
+	defaultModel := client.GenerativeModel("gemma-4-31b-it")
+	defaultModel.ResponseMIMEType = "application/json"
 
-
-	
-	model.ResponseSchema = &genai.Schema{
+	schema := &genai.Schema{
 		Type: genai.TypeObject,
 		Properties: map[string]*genai.Schema{
 			"message_to_user": {
@@ -228,26 +238,73 @@ func NewGeminiClient(apiKey string) (*GeminiClient, error) {
 		Required: []string{"message_to_user", "message_to_self", "next_timer_minutes"},
 	}
 
+	roadmapModelNames := []string{"gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"}
+	var roadmapModels []roadmapModelEntry
+	for _, name := range roadmapModelNames {
+		m := client.GenerativeModel(name)
+		m.ResponseMIMEType = "application/json"
+		m.ResponseSchema = schema
+		roadmapModels = append(roadmapModels, roadmapModelEntry{model: m, name: name})
+	}
+
+	defaultModel.ResponseSchema = schema
+
 	return &GeminiClient{
-		client: client,
-		model:  model,
+		client:        client,
+		defaultModel:  defaultModel,
+		roadmapModels: roadmapModels,
 	}, nil
 }
 
-func (g *GeminiClient) Evaluate(prompt string, strictMode bool) (*models.AIResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func (g *GeminiClient) Evaluate(prompt string, strictMode bool, triggerReason string) (*models.AIResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 	
-	if strictMode {
-		g.model.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(strictSystemInstruction)}}
+	triggerLower := strings.ToLower(triggerReason)
+	isRoadmap := strings.Contains(triggerLower, "/goal") || strings.Contains(triggerLower, "roadmap") || strings.Contains(triggerLower, "syllabus")
+
+	var modelCandidates []roadmapModelEntry
+	if isRoadmap {
+		modelCandidates = g.roadmapModels
 	} else {
-		g.model.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(lenientSystemInstruction)}}
+		modelCandidates = []roadmapModelEntry{{model: g.defaultModel, name: "gemma-4-31b-it"}}
 	}
-	
-	log.Println("Sending prompt to Gemini API...")
-	resp, err := g.model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		log.Printf("Gemini GenerateContent returned error: %v", err)
+
+	var resp *genai.GenerateContentResponse
+	var err error
+
+	recitationRetries := 0
+	for i := 0; i < len(modelCandidates); i++ {
+		entry := modelCandidates[i]
+		if strictMode {
+			entry.model.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(strictSystemInstruction)}}
+		} else {
+			entry.model.SystemInstruction = &genai.Content{Parts: []genai.Part{genai.Text(lenientSystemInstruction)}}
+		}
+
+		log.Printf("Sending prompt to %s...", entry.name)
+		resp, err = entry.model.GenerateContent(ctx, genai.Text(prompt))
+		if err == nil {
+			break
+		}
+
+		errStr := err.Error()
+		
+		// Recitation errors are transient — retry the same model up to 2 times
+		if strings.Contains(errStr, "Recitation") && recitationRetries < 2 {
+			recitationRetries++
+			log.Printf("Recitation filter triggered on %s. Retrying (%d/2)...", entry.name, recitationRetries)
+			time.Sleep(3 * time.Second)
+			i-- // retry same model index
+			continue
+		}
+
+		if strings.Contains(errStr, "429") && i < len(modelCandidates)-1 {
+			log.Printf("Rate limited (429) on %s. Falling back to next model...", entry.name)
+			continue
+		}
+
+		log.Printf("Gemini GenerateContent returned error on %s: %v", entry.name, err)
 		return nil, err
 	}
 	log.Println("Received response from Gemini API!")
