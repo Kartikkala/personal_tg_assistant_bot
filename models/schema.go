@@ -13,6 +13,7 @@ type AIResponse struct {
 	UpdateTaskDeadlines    []UpdateTaskDeadline `json:"update_task_deadlines"`
 	NextTimerMinutes       int                  `json:"next_timer_minutes"`
 	SkipQuizRequested      bool                 `json:"skip_quiz_requested"`
+	StartQuizzes           []string             `json:"start_quizzes"`
 }
 
 type UpdateTaskDeadline struct {

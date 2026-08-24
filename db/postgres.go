@@ -84,6 +84,7 @@ func (p *PostgresDB) initTables() error {
 			message_id INT DEFAULT 0,
 			status VARCHAR(50) DEFAULT 'active'
 		)`,
+		`ALTER TABLE quiz_sessions ALTER COLUMN task_id TYPE TEXT`,
 	}
 
 	for _, query := range queries {

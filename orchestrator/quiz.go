@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -27,13 +29,13 @@ func (o *Orchestrator) StartQuiz(taskID string) {
 		}
 	}
 	
-	// If not found in relevant, fetch it directly
+	// If not found in relevant, assume it's an ad-hoc topic and use the string directly
 	if task == nil {
-		task = &models.Task{ID: taskID, Description: "Unknown Topic"}
+		task = &models.Task{ID: "ad_hoc", Description: taskID}
 	}
 
 	isGoal := false
-	if task.ParentID == nil {
+	if task.ParentID == nil && task.ID != "ad_hoc" {
 		isGoal = true
 	}
 
@@ -43,9 +45,7 @@ func (o *Orchestrator) StartQuiz(taskID string) {
 
 	resp, err := o.llm.GenerateQuiz(context.Background(), task, difficulty, isGoal)
 	if err != nil {
-		log.Printf("Error generating quiz: %v", err)
-		o.bot.SendMessageHTML("❌ Error generating quiz. I'll just mark the task as complete for now.")
-		o.db.MarkTasksCompleted([]string{taskID})
+		o.bot.SendMessageHTML("❌ Error generating quiz due to AI limits. The task will NOT be marked as completed until we can verify it. Please try again later.")
 		return
 	}
 
@@ -66,12 +66,63 @@ func (o *Orchestrator) StartQuiz(taskID string) {
 	o.serveQuizQuestion(sessionID, resp.Questions, 0, 0, []string{})
 }
 
+func cleanMarkdownForTelegram(text string) string {
+	text = html.EscapeString(text)
+
+	// Normalize code block starts
+	re := regexp.MustCompile("```([a-zA-Z0-9]+)\n")
+	text = re.ReplaceAllString(text, "```\n")
+
+	parts := strings.Split(text, "```")
+	var sb strings.Builder
+	for i, part := range parts {
+		if i%2 == 0 {
+			sb.WriteString(part)
+		} else {
+			if strings.HasPrefix(part, "\n") {
+				part = part[1:]
+			}
+			sb.WriteString("<pre>")
+			sb.WriteString(part)
+			sb.WriteString("</pre>")
+		}
+	}
+	text = sb.String()
+
+	sb.Reset()
+	inCode := false
+	for _, char := range text {
+		if char == '`' {
+			if inCode {
+				sb.WriteString("</code>")
+			} else {
+				sb.WriteString("<code>")
+			}
+			inCode = !inCode
+		} else {
+			sb.WriteRune(char)
+		}
+	}
+	text = sb.String()
+
+	boldRe := regexp.MustCompile(`\*\*(.*?)\*\*`)
+	text = boldRe.ReplaceAllString(text, "<b>$1</b>")
+
+	return text
+}
+
 func (o *Orchestrator) serveQuizQuestion(sessionID int, questions []models.QuizQuestion, index int, correctAnswers int, failedTopics []string) {
 	q := questions[index]
+	cleanQuestion := cleanMarkdownForTelegram(q.Question)
+	text := fmt.Sprintf("📝 <b>Question %d/%d</b>\n\n%s\n\n", index+1, len(questions), cleanQuestion)
 	
-	text := fmt.Sprintf("📝 <b>Question %d/%d</b>\n\n%s", index+1, len(questions), q.Question)
-	
-	msgID, err := o.bot.SendQuizQuestion(text, q.Options)
+	var buttonLabels []string
+	for i, opt := range q.Options {
+		text += fmt.Sprintf("<b>%c)</b> %s\n", 'A'+i, cleanMarkdownForTelegram(opt))
+		buttonLabels = append(buttonLabels, fmt.Sprintf("%c", 'A'+i))
+	}
+
+	msgID, err := o.bot.SendQuizQuestion(text, buttonLabels)
 	if err != nil {
 		log.Printf("Error sending quiz question: %v", err)
 		return
@@ -104,18 +155,27 @@ func (o *Orchestrator) handleQuizCallback(data string) {
 	answerIdx, _ := strconv.Atoi(parts[2])
 	q := session.Questions[session.CurrentIndex]
 
+	// Bounds checking in case LLM hallucinates an invalid index or options array length
+	if q.CorrectIndex < 0 || q.CorrectIndex >= len(q.Options) {
+		q.CorrectIndex = 0 
+	}
+	if answerIdx < 0 || answerIdx >= len(q.Options) {
+		answerIdx = 0
+	}
+
 	isCorrect := answerIdx == q.CorrectIndex
 	
-	resultText := fmt.Sprintf("📝 <b>Question %d/%d</b>\n\n%s\n\n", session.CurrentIndex+1, len(session.Questions), q.Question)
-	resultText += fmt.Sprintf("Your Answer: %s\n", q.Options[answerIdx])
+	cleanQuestion := cleanMarkdownForTelegram(q.Question)
+	resultText := fmt.Sprintf("📝 <b>Question %d/%d</b>\n\n%s\n\n", session.CurrentIndex+1, len(session.Questions), cleanQuestion)
+	resultText += fmt.Sprintf("Your Answer: <b>%c)</b> %s\n", 'A'+answerIdx, cleanMarkdownForTelegram(q.Options[answerIdx]))
 	
 	if isCorrect {
 		resultText += "✅ <b>CORRECT!</b>\n"
 		session.CorrectAnswers++
 	} else {
-		resultText += fmt.Sprintf("❌ <b>WRONG!</b>\nCorrect Answer was: %s\n", q.Options[q.CorrectIndex])
+		resultText += fmt.Sprintf("❌ <b>WRONG!</b>\nCorrect Answer was: <b>%c)</b> %s\n", 'A'+q.CorrectIndex, cleanMarkdownForTelegram(q.Options[q.CorrectIndex]))
 	}
-	resultText += fmt.Sprintf("\n<i>Explanation: %s</i>", q.Explanation)
+	resultText += fmt.Sprintf("\n<i>Explanation: %s</i>", cleanMarkdownForTelegram(q.Explanation))
 
 	o.bot.EditQuizResult(session.MessageID, resultText)
 

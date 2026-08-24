@@ -29,7 +29,9 @@ const commonTaskRules = `
 - If the user asks to recalculate, reschedule, or update a deadline, YOU MUST use the update_task_deadlines function to reflect the changes in the database. Do not just output a new schedule in text without actually calling the function!
 - If the user explicitly asks to DELETE, cancel, or remove a task, YOU MUST use the delete_tasks function. Due to cascading deletes, deleting a parent goal will automatically delete all of its subtasks.
 - QUIZ VALIDATION RULE: By default, when a user finishes a task, the system will generate a Quiz to validate their knowledge. If the user says they finished a task, YOU MUST include it in 'mark_tasks_completed'. 
+- IF the user explicitly asks to start a quiz on a topic WITHOUT marking it completed, you MUST use the 'start_quizzes' array and provide the task ID. Do not use 'mark_tasks_completed' for this.
 - IF the user explicitly says they want to skip the quiz, bypass the quiz, or that they already know the topic well, you MUST set 'skip_quiz_requested' to true.
+- VERY IMPORTANT: If you are launching a quiz (via start_quizzes OR because skip_quiz_requested is false during completion), DO NOT say "I've marked the task as completed" in your 'message_to_user'. Tell the user you are launching a validation quiz.
 - If you use delete_tasks or mark_tasks_completed on a task, DO NOT use update_task_deadlines on it.
 - A "Goal" is any task whose deadline spans multiple days (i.e. finishes tomorrow or later).
 - A "Task" is anything meant to be finished today (by EOD). 
@@ -239,6 +241,11 @@ func NewGeminiClient(apiKey string) (*GeminiClient, error) {
 				Type:        genai.TypeBoolean,
 				Description: "Set to true if the user explicitly asked to skip, bypass, or opt-out of the quiz when finishing a task.",
 			},
+			"start_quizzes": {
+				Type: genai.TypeArray,
+				Items: &genai.Schema{Type: genai.TypeString},
+				Description: "Array of task IDs to explicitly launch a quiz for. Use this if the user asks to be quizzed on a specific topic or wants to start a quiz without marking a task as completed. You can also provide a freeform string like 'Python Syntax' if the user asks for an ad-hoc quiz not in their tasks.",
+			},
 		},
 		Required: []string{"message_to_user", "message_to_self", "next_timer_minutes"},
 	}
@@ -344,11 +351,14 @@ func (g *GeminiClient) Evaluate(prompt string, strictMode bool, triggerReason st
 }
 
 func (g *GeminiClient) GenerateQuiz(ctx context.Context, task *models.Task, difficulty string, isGoal bool) (*models.QuizGenerationResponse, error) {
-	var modelName string
+	var modelCandidates []string
 	if isGoal {
-		modelName = g.roadmapModels[0].name
+		for _, m := range g.roadmapModels {
+			modelCandidates = append(modelCandidates, m.name)
+		}
+		modelCandidates = append(modelCandidates, "gemma-4-31b-it")
 	} else {
-		modelName = "gemma-4-31b-it"
+		modelCandidates = []string{"gemma-4-31b-it", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"}
 	}
 
 	schema := &genai.Schema{
@@ -372,16 +382,25 @@ func (g *GeminiClient) GenerateQuiz(ctx context.Context, task *models.Task, diff
 		Required: []string{"questions"},
 	}
 
-	// Create a temporary model instance to not mutate the default schema permanently if shared
-	tempModel := g.client.GenerativeModel(modelName)
-	tempModel.ResponseMIMEType = "application/json"
-	tempModel.ResponseSchema = schema
-
 	prompt := fmt.Sprintf("Generate a quiz for the topic: '%s'. Difficulty level: %s. Is this a major Goal? %v. If it is a goal, generate up to 20 questions including at least 1 coding scenario. If it is a subtask, generate 3 to 10 questions.", task.Description, difficulty, isGoal)
-	
-	resp, err := tempModel.GenerateContent(ctx, genai.Text(prompt))
+
+	var resp *genai.GenerateContentResponse
+	var err error
+
+	for _, name := range modelCandidates {
+		tempModel := g.client.GenerativeModel(name)
+		tempModel.ResponseMIMEType = "application/json"
+		tempModel.ResponseSchema = schema
+
+		resp, err = tempModel.GenerateContent(ctx, genai.Text(prompt))
+		if err == nil {
+			break
+		}
+		log.Printf("GenerateQuiz Model %s failed: %v", name, err)
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("all models failed to generate quiz. last error: %v", err)
 	}
 
 	part := resp.Candidates[0].Content.Parts[0]
@@ -390,9 +409,18 @@ func (g *GeminiClient) GenerateQuiz(ctx context.Context, task *models.Task, diff
 		return nil, fmt.Errorf("expected text response from Gemini")
 	}
 
+	cleanText := strings.TrimSpace(string(textPart))
+	if strings.HasPrefix(cleanText, "```json") {
+		cleanText = strings.TrimPrefix(cleanText, "```json")
+	} else if strings.HasPrefix(cleanText, "```") {
+		cleanText = strings.TrimPrefix(cleanText, "```")
+	}
+	cleanText = strings.TrimSuffix(cleanText, "```")
+	cleanText = strings.TrimSpace(cleanText)
+
 	var quizResp models.QuizGenerationResponse
-	if err := json.Unmarshal([]byte(textPart), &quizResp); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(cleanText), &quizResp); err != nil {
+		return nil, fmt.Errorf("failed to parse AI response JSON: %v\nRaw response: %s", err, cleanText)
 	}
 	return &quizResp, nil
 }
@@ -421,15 +449,26 @@ func (g *GeminiClient) AnalyzeQuiz(ctx context.Context, session *models.QuizSess
 		Required: []string{"message_to_user", "passed"},
 	}
 
-	tempModel := g.client.GenerativeModel("gemma-4-31b-it")
-	tempModel.ResponseMIMEType = "application/json"
-	tempModel.ResponseSchema = schema
-
+	modelCandidates := []string{"gemma-4-31b-it", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"}
 	prompt := fmt.Sprintf("Analyze quiz performance for task: '%s'. Score: %d / %d. Difficulty was: %s. Determine if they passed. If they failed, generate new tasks for the topics they failed.", session.TaskID, session.CorrectAnswers, len(session.Questions), difficulty)
 
-	resp, err := tempModel.GenerateContent(ctx, genai.Text(prompt))
+	var resp *genai.GenerateContentResponse
+	var err error
+
+	for _, name := range modelCandidates {
+		tempModel := g.client.GenerativeModel(name)
+		tempModel.ResponseMIMEType = "application/json"
+		tempModel.ResponseSchema = schema
+
+		resp, err = tempModel.GenerateContent(ctx, genai.Text(prompt))
+		if err == nil {
+			break
+		}
+		log.Printf("AnalyzeQuiz Model %s failed: %v", name, err)
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("all models failed to analyze quiz. last error: %v", err)
 	}
 
 	part := resp.Candidates[0].Content.Parts[0]
@@ -438,9 +477,18 @@ func (g *GeminiClient) AnalyzeQuiz(ctx context.Context, session *models.QuizSess
 		return nil, fmt.Errorf("expected text")
 	}
 
+	cleanText := strings.TrimSpace(string(textPart))
+	if strings.HasPrefix(cleanText, "```json") {
+		cleanText = strings.TrimPrefix(cleanText, "```json")
+	} else if strings.HasPrefix(cleanText, "```") {
+		cleanText = strings.TrimPrefix(cleanText, "```")
+	}
+	cleanText = strings.TrimSuffix(cleanText, "```")
+	cleanText = strings.TrimSpace(cleanText)
+
 	var analysis models.QuizAnalysisResponse
-	if err := json.Unmarshal([]byte(textPart), &analysis); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(cleanText), &analysis); err != nil {
+		return nil, fmt.Errorf("failed to parse AI response JSON: %v\nRaw response: %s", err, cleanText)
 	}
 	return &analysis, nil
 }

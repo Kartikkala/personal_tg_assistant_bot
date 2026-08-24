@@ -40,6 +40,12 @@ func (o *Orchestrator) Start(messageChan <-chan string) {
 	go o.RunCycle("System initialized. Ask the user what they want to work on.")
 	go o.callScheduler()
 
+	// Resume any active quiz
+	if session, err := o.db.GetActiveQuizSession(); err == nil && session != nil {
+		log.Printf("Resuming active quiz session for task %s at index %d", session.TaskID, session.CurrentIndex)
+		go o.serveQuizQuestion(session.SessionID, session.Questions, session.CurrentIndex, session.CorrectAnswers, []string{})
+	}
+
 	for {
 		select {
 		case msg := <-messageChan:
@@ -106,6 +112,19 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 	}
 	if strings.HasPrefix(triggerReason, "User message received: /tasks") {
 		o.handleTasksCommand()
+		return
+	}
+	if strings.HasPrefix(triggerReason, "User message received: /quiz") {
+		parts := strings.SplitN(triggerReason, "/quiz", 2)
+		if len(parts) >= 2 {
+			topic := strings.TrimSpace(parts[1])
+			if topic == "" {
+				o.bot.SendMessage("❌ Usage: /quiz <topic>\nExample: /quiz Python Syntax")
+				o.db.LogMessage("ai", "❌ Usage: /quiz <topic>")
+				return
+			}
+			go o.StartQuiz(topic)
+		}
 		return
 	}
 
@@ -329,6 +348,12 @@ func (o *Orchestrator) RunCycle(triggerReason string) {
 			log.Printf("Error cancelling recurring calls: %v", err)
 		} else {
 			log.Printf("Cancelled recurring calls: %v", response.CancelRecurringCalls)
+		}
+	}
+	
+	if len(response.StartQuizzes) > 0 {
+		for _, qID := range response.StartQuizzes {
+			go o.StartQuiz(qID)
 		}
 	}
 
